@@ -1,0 +1,1499 @@
+---
+title: "XGBoost, GLM and Univariate Predictive Models"
+output: html_notebook
+author: HA Hill
+date: 11-28-22
+
+---
+
+#Data exploration
+
+```{r}
+library(corrplot)
+corrplot(cor(MCL %>% select_if(is.numeric), use="pairwise.complete.obs"))
+```
+
+#XGBoost Classification Model with clinical, NGS and cytogenetic data
+#Split dataset into training and test set. 
+#Make folds for cross-validation
+```{r}
+library(tidymodels)
+library(doParallel)
+
+set.seed(102)
+mcl_split <- initial_split(MCL, strata=status)
+mcl_train <- training(mcl_split)
+mcl_test <- testing(mcl_split)
+
+mcl_folds<-vfold_cv(mcl_train, strata=status)
+
+```
+#Data preprocessing steps with recipe. Note: this will create new levels in a factor variable. This is okay with the XGBoost model
+```{r}
+mcl_recipe<-recipe(status ~.,data=mcl_train) %>% 
+  update_role(pt_id, new_role = "id variable") %>% 
+  step_other(all_nominal_predictors(),threshold = 0.02) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_predictors()) 
+
+   
+
+
+
+mcl_prep <- prep(mcl_recipe)
+mcl_data_preprocessed <- juice(mcl_prep)
+juice(mcl_prep)
+```
+
+#Tune hyperparameters
+```{r}
+xgb_spec <- boost_tree(
+  trees= 2000,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry= tune(),
+  learn_rate = tune()) %>% 
+  set_engine("xgboost", ) %>% 
+  set_mode("classification")
+
+xgb_spec
+```
+
+#Use grid based / space fitting to cover hyperparameter space
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  min_n(),
+  tree_depth(),
+  loss_reduction (),
+  learn_rate(),
+  finalize(mtry(), mcl_train),
+  sample_size = sample_prop(),
+  size = 50
+)
+
+
+
+xgb_grid 
+```
+#Finalize workflow with recipe and hyperparameter tuning specifications
+```{r}
+xgb_wf <- workflow() %>%
+  add_recipe(mcl_recipe) %>% 
+  add_model(xgb_spec)
+
+xgb_wf
+```
+#Make function for getting variable importance from folds
+```{r}
+get_xgb_imp <- function(x) {
+  x %>% 
+    extract_fit_parsnip() %>% 
+    vip::vi()
+}
+```
+
+#Set up parallel processing
+#Tune using the grid of hyperparameters and the resampled folds
+#You may get warnings for new levels created for sparse features - the hyperparameter fit will still work.
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(102)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = mcl_folds,
+  grid = xgb_grid,
+  control = control_grid(extract=get_xgb_imp,save_pred = TRUE)
+)
+
+xgb_res
+```
+#Collect metrics
+```{r}
+collect_metrics(xgb_res)
+```
+#Visualize hyperparameter metrics for the possible models
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+#Show the best performing set of parameters
+```{r}
+best_models <- show_best(xgb_res, "roc_auc")
+best_models
+
+```
+#Select best hyperparameters based on AUC
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+```
+#Look at feature importance in the trained stratified folds.
+
+```{r}
+library(vip)
+library(jcolors)
+
+xgb_res %>% 
+  select(id, .extracts) %>% 
+  unnest(.extracts) %>% 
+  unnest(.extracts) %>% 
+  group_by(Variable) %>% 
+  summarise(Mean=mean(Importance),
+            Variance=sd(Importance)) %>% 
+  slice_max(Mean, n=30) %>% 
+  ggplot(aes(Mean, reorder(Variable, Mean))) +
+  geom_crossbar(aes(xmin=Mean-Variance, xmax=Mean+Variance)) +
+    labs(x="Variable Importance", y=NULL)
+
+
+```
+
+#Finalize workflow with the hyperparameter values
+```{r}
+final_xgb <- 
+  finalize_workflow(xgb_wf, best_auc)
+
+final_xgb
+```
+##Incorporate the hyperparameter values into the last fit and fit the model on the test set.
+```{r}
+xgb_last_all <- final_xgb %>% 
+  last_fit(mcl_split) %>% mutate(model="All Feature Types")
+```
+#Evaluate model performance.
+```{r}
+final_res <- last_fit(final_xgb, mcl_split)
+final_metrics_all <- collect_metrics(final_res)
+final_metrics_all
+```
+#Make a confusion matrix showing predictions.
+```{r}
+collect_predictions(xgb_last_all) %>% 
+  conf_mat(status, .pred_class) 
+```
+
+
+#Which variables were most important to the prediction? Make Variable Importance Plot (VIP). 
+
+```{r}
+library(vip)
+library(jcolors)
+xgb_fit <-extract_fit_parsnip(final_res)
+vip(xgb_fit, geom="col", num_features=20, aesthetics=list(color="grey50", fill="#1b98e0")) 
+                                                                            
+                                                                          
+```
+#Get model agnostic Shapley additive explanations (SHAP) and plot.
+```{r}
+library(SHAPforxgboost)
+mcl_shap <-
+  shap.prep(
+    xgb_model = extract_fit_engine(xgb_fit),
+    X_train = bake(mcl_prep,
+    has_role("predictor"),
+    new_data=NULL,
+    composition="matrix"
+    ), top_n=20
+  )
+```
+
+```{r}
+shap.plot.summary(mcl_shap, dilute=TRUE)
+```
+
+#Plot ROC 
+
+```{r}
+final_res %>%
+  collect_predictions() %>%
+  group_by(id) %>% 
+  roc_curve(status, .pred_aggressive) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color=id)) +
+  geom_line(size = 1.5, color = "#1b98e0") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  )
+```
+#Make a dataframe of final predictions for visualization
+```{r}
+all_feature_model_predict <- final_res %>%
+  collect_predictions() %>%
+  group_by(id)
+```
+
+
+#XGBoost Model with clinical features only
+#Split dataset into training and test set. 
+#Make folds for cross-validation
+```{r}
+library(tidymodels)
+library(doParallel)
+
+set.seed(102)
+mcl_split <- initial_split(MCL_clinic, strata=status)
+mcl_train <- training(mcl_split)
+mcl_test <- testing(mcl_split)
+
+mcl_folds<-vfold_cv(mcl_train, strata=status)
+
+```
+#Data preprocessing steps with recipe. Note: this will create new levels in a factor variable. This is okay with the XGBoost model
+```{r}
+mcl_recipe<-recipe(status ~.,data=mcl_train) %>% 
+  update_role(pt_id, new_role = "id variable") %>% 
+  step_other(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_nominal_predictors())  
+
+
+mcl_prep <- prep(mcl_recipe)
+juice(mcl_prep)
+```
+
+#Tune hyperparameters
+```{r}
+xgb_spec <- boost_tree(
+  trees= 2000,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry= tune(),
+  learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_spec
+```
+
+#Use grid based / space fitting to cover hyperparameter space
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  min_n(),
+  sample_size=sample_prop(),
+  tree_depth(),
+  loss_reduction (),
+  learn_rate(),
+  finalize(mtry(), mcl_train),
+  size = 50
+)
+
+xgb_grid 
+```
+#Finalize workflow with recipe and hyperparameter tuning specifications
+```{r}
+xgb_wf <- workflow() %>%
+  add_recipe(mcl_recipe) %>% 
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+#Set up parallel processing
+#Tune using the grid of hyperparameters and the resampled folds
+#You may get warnings for new levels created for sparse features - the hyperparameter fit will still work.
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(102)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = mcl_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+```
+#Collect metrics
+```{r}
+collect_metrics(xgb_res)
+```
+
+#Visualize hyperparameter metrics for the possible models
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+#Show the best performing set of parameters
+```{r}
+show_best(xgb_res, "roc_auc")
+```
+#Select best hyperparameters based on AUC
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+```
+#Finalize workflow with the hyperparameter values
+```{r}
+final_xgb <- 
+  finalize_workflow(xgb_wf, best_auc)
+
+final_xgb
+```
+
+##Incorporate the hyperparameter values into the last fit and fit the model on the test set.
+```{r}
+xgb_last_clinical <- final_xgb %>% 
+  last_fit(mcl_split) %>% mutate(model="Clinical Only")
+```
+#Evaluate model performance.
+```{r}
+final_res <- last_fit(final_xgb, mcl_split)
+collect_metrics(final_res)
+```
+#Make a confusion matrix showing predictions.
+```{r}
+collect_predictions(xgb_last_clinical) %>% 
+  conf_mat(status, .pred_class) 
+```
+#Which variables were most important to the prediction? Make Variable Importance Plot (VIP). 
+
+```{r}
+xgb_fit <-extract_fit_parsnip(final_res)
+vip(xgb_fit, geom="col", num_features=20, aesthetics=list(color="grey50", fill=" purple"))
+```
+
+#Get model agnostic Shapley additive explanations (SHAP) and plot.
+```{r}
+mcl_shap <-
+  shap.prep(
+    xgb_model = extract_fit_engine(xgb_fit),
+    X_train = bake(mcl_prep,
+    has_role("predictor"),
+    new_data=NULL,
+    composition="matrix"
+    ), top_n=20
+  )
+```
+
+```{r}
+shap.plot.summary(mcl_shap, dilute=TRUE)
+```
+```{r}
+final_res %>%
+  collect_predictions() %>%
+  group_by(id) %>% 
+  roc_curve(status, .pred_aggressive) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color=id)) +
+  geom_line(size = 1.5, color = "purple") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  )
+```
+```{r}
+clinical_model_predict <- final_res %>%
+  collect_predictions() %>%
+  group_by(id)
+```
+
+
+##XGBoost Model with clinical and ngs
+#Split dataset into training and test set. 
+#Make folds for cross-validation
+```{r}
+library(tidymodels)
+library(doParallel)
+
+set.seed(102)
+mcl_split <- initial_split(MCL_clinic_ngs, strata=status)
+mcl_train <- training(mcl_split)
+mcl_test <- testing(mcl_split)
+
+mcl_folds<-vfold_cv(mcl_train, strata=status)
+
+```
+#Data preprocessing steps with recipe. Note: this will create new levels in a factor variable. This is okay with the XGBoost model
+```{r}
+mcl_recipe<-recipe(status ~.,data=mcl_train) %>% 
+  update_role(pt_id, new_role = "id variable") %>% 
+  step_other(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_nominal_predictors())  
+
+
+mcl_prep <- prep(mcl_recipe)
+juice(mcl_prep)
+```
+
+#Tune hyperparameters
+```{r}
+xgb_spec <- boost_tree(
+  trees= 2000,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry= tune(),
+  learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_spec
+```
+
+#Use grid based / space fitting to cover hyperparameter space
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  min_n(),
+  sample_size=sample_prop(),
+  tree_depth(),
+  loss_reduction (),
+  learn_rate(),
+  finalize(mtry(), mcl_train),
+  size = 50
+)
+
+xgb_grid 
+```
+#Finalize workflow with recipe and hyperparameter tuning specifications
+```{r}
+xgb_wf <- workflow() %>%
+  add_recipe(mcl_recipe) %>% 
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+#Set up parallel processing
+#Tune using the grid of hyperparameters and the resampled folds
+#You may get warnings for new levels created for sparse features - the hyperparameter fit will still work.
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(102)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = mcl_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+```
+#Collect metrics
+```{r}
+collect_metrics(xgb_res)
+```
+
+#Visualize hyperparameter metrics for the possible models
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+#Show the best performing set of parameters
+```{r}
+show_best(xgb_res, "roc_auc")
+```
+#Select best hyperparameters based on AUC
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+```
+#Finalize workflow with the hyperparameter values
+```{r}
+final_xgb <- 
+  finalize_workflow(xgb_wf, best_auc)
+
+final_xgb
+```
+
+##Incorporate the hyperparameter values into the last fit and fit the model on the test set.
+```{r}
+xgb_last_clin_ngs <- final_xgb %>% 
+  last_fit(mcl_split) %>% mutate(model="Clinical and NGS")
+```
+#Evaluate model performance.
+```{r}
+final_res <- last_fit(final_xgb, mcl_split)
+collect_metrics(final_res)
+```
+#Make a confusion matrix showing predictions.
+```{r}
+collect_predictions(xgb_last_clin_ngs) %>% 
+  conf_mat(status, .pred_class) 
+```
+#Which variables were most important to the prediction? Make Variable Importance Plot (VIP). 
+
+```{r}
+xgb_fit <-extract_fit_parsnip(final_res)
+vip(xgb_fit, geom="col", num_features=20, aesthetics=list(color="grey50", fill=" light green"))
+```
+
+#Get model agnostic Shapley additive explanations (SHAP) and plot.
+```{r}
+mcl_shap <-
+  shap.prep(
+    xgb_model = extract_fit_engine(xgb_fit),
+    X_train = bake(mcl_prep,
+    has_role("predictor"),
+    new_data=NULL,
+    composition="matrix"
+    ), top_n=20
+  )
+```
+
+```{r}
+shap.plot.summary(mcl_shap, dilute=TRUE)
+```
+#Plot ROC
+
+```{r}
+final_res %>%
+  collect_predictions() %>%
+  group_by(id) %>% 
+  roc_curve(status, .pred_aggressive) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color=id)) +
+  geom_line(size = 1.5, color = "light green") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  )
+```
+#Make a dataframe of final predictions for visualization
+```{r}
+clinical_ngs_model_predict <- final_res %>%
+  collect_predictions() %>%
+  group_by(id)
+```
+
+
+#XGBoost Model with clinical, pathology and cytogenetic features only
+#Split dataset into training and test set. 
+#Make folds for cross-validation
+```{r}
+library(tidymodels)
+library(doParallel)
+
+set.seed(102)
+mcl_split <- initial_split(MCL_clinic_cyto, strata=status)
+mcl_train <- training(mcl_split)
+mcl_test <- testing(mcl_split)
+
+mcl_folds<-vfold_cv(mcl_train, strata=status)
+
+```
+#Data preprocessing steps with recipe. Note: this will create new levels in a factor variable. This is okay with the XGBoost model
+```{r}
+mcl_recipe<-recipe(status ~.,data=mcl_train) %>% 
+  update_role(pt_id, new_role = "id variable") %>% 
+  step_other(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_nominal_predictors())  
+
+
+mcl_prep <- prep(mcl_recipe)
+juice(mcl_prep)
+```
+
+#Tune hyperparameters
+```{r}
+xgb_spec <- boost_tree(
+  trees= 2000,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry= tune(),
+  learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_spec
+```
+
+#Use grid based / space fitting to cover hyperparameter space
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  min_n(),
+  sample_size=sample_prop(),
+  tree_depth(),
+  loss_reduction (),
+  learn_rate(),
+  finalize(mtry(), mcl_train),
+  size = 50
+)
+
+xgb_grid 
+```
+#Finalize workflow with recipe and hyperparameter tuning specifications
+```{r}
+xgb_wf <- workflow() %>%
+  add_recipe(mcl_recipe) %>% 
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+#Set up parallel processing
+#Tune using the grid of hyperparameters and the resampled folds
+#You may get warnings for new levels created for sparse features - the hyperparameter fit will still work.
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(102)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = mcl_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+```
+#Collect metrics
+```{r}
+collect_metrics(xgb_res)
+```
+
+#Visualize hyperparameter metrics for the possible models
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+#Show the best performing set of parameters
+```{r}
+show_best(xgb_res, "roc_auc")
+```
+#Select best hyperparameters based on AUC
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+```
+#Finalize workflow with the hyperparameter values
+```{r}
+final_xgb <- 
+  finalize_workflow(xgb_wf, best_auc)
+
+final_xgb
+```
+
+##Incorporate the hyperparameter values into the last fit and fit the model on the test set.
+```{r}
+xgb_last_clin_cyto <- final_xgb %>% 
+  last_fit(mcl_split) %>% mutate(model="Clinical and Cytogenetic")
+```
+#Evaluate model performance.
+```{r}
+final_res <- last_fit(final_xgb, mcl_split)
+collect_metrics(final_res)
+```
+#Make a confusion matrix showing predictions.
+```{r}
+collect_predictions(xgb_last_clin_cyto) %>% 
+  conf_mat(status, .pred_class) 
+```
+#Which variables were most important to the prediction? Make Variable Importance Plot (VIP). 
+
+```{r}
+library(vip)
+xgb_fit <-extract_fit_parsnip(final_res)
+vip(xgb_fit, geom="col", num_features=20, aesthetics=list(color="grey50", fill="maroon"))
+```
+
+#Get model agnostic Shapley additive explanations (SHAP) and plot.
+```{r}
+library(SHAPforxgboost)
+
+mcl_shap <-
+  shap.prep(
+    xgb_model = extract_fit_engine(xgb_fit),
+    X_train = bake(mcl_prep,
+    has_role("predictor"),
+    new_data=NULL,
+    composition="matrix"
+    ), top_n=20
+  )
+```
+
+```{r}
+shap.plot.summary(mcl_shap, dilute=TRUE)
+```
+#Plot ROC Curve
+
+```{r}
+final_res %>%
+  collect_predictions() %>%
+  group_by(id) %>% 
+  roc_curve(status, .pred_aggressive) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color=id)) +
+  geom_line(size = 1.5, color = "maroon") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  )
+```
+
+
+#Save results in a df to combine in ROC curve figure
+```{r}
+clinical_cytoCL_pars_model_predict <- final_res %>%
+  collect_predictions() %>%
+  group_by(id)
+```
+
+##XGBoost Model with combined fearure selected set  - "parsimonious"
+#Split dataset into training and test set. 
+#Make folds for cross-validation
+```{r}
+library(tidymodels)
+library(doParallel)
+
+set.seed(102)
+mcl_split <- initial_split(MCL_parsimony, strata=status)
+mcl_train <- training(mcl_split)
+mcl_test <- testing(mcl_split)
+
+mcl_folds<-vfold_cv(mcl_train, strata=status)
+
+```
+#Data preprocessing steps with recipe. Note: this will create new levels in a factor variable. This is okay with the XGBoost model
+```{r}
+mcl_recipe<-recipe(status ~.,data=mcl_train) %>% 
+  update_role(pt_id, new_role = "id variable") %>% 
+  step_other(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_nominal_predictors())  
+
+
+mcl_prep <- prep(mcl_recipe)
+juice(mcl_prep)
+```
+
+#Tune hyperparameters
+```{r}
+xgb_spec <- boost_tree(
+  trees= 2000,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry= tune(),
+  learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_spec
+```
+
+#Use grid based / space fitting to cover hyperparameter space
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  min_n(),
+  sample_size=sample_prop(),
+  tree_depth(),
+  loss_reduction (),
+  learn_rate(),
+  finalize(mtry(), mcl_train),
+  size = 40
+)
+
+xgb_grid 
+```
+#Finalize workflow with recipe and hyperparameter tuning specifications
+```{r}
+xgb_wf <- workflow() %>%
+  add_recipe(mcl_recipe) %>% 
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+#Set up parallel processing
+#Tune using the grid of hyperparameters and the resampled folds
+#You may get warnings for new levels created for sparse features - the hyperparameter fit will still work.
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(102)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = mcl_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+```
+#Collect metrics
+```{r}
+collect_metrics(xgb_res)
+```
+
+#Visualize hyperparameter metrics for the possible models
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+#Show the best performing set of parameters
+```{r}
+show_best(xgb_res, "roc_auc")
+```
+#Select best hyperparameters based on AUC
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+```
+#Finalize workflow with the hyperparameter values
+```{r}
+final_xgb <- 
+  finalize_workflow(xgb_wf, best_auc)
+
+final_xgb
+```
+##Incorporate the hyperparameter values into the last fit and fit the model on the test set.
+```{r}
+xgb_last_pars <- final_xgb %>% 
+  last_fit(mcl_split) %>% mutate(model="Parsimonious")
+```
+#Evaluate model performance.
+```{r}
+final_res <- last_fit(final_xgb, mcl_split)
+collect_metrics(final_res)
+```
+#Make a confusion matrix showing predictions.
+```{r}
+collect_predictions(xgb_last_pars) %>% 
+  conf_mat(status, .pred_class) 
+```
+#Which variables were most important to the prediction? Make Variable Importance Plot (VIP). 
+
+```{r}
+
+xgb_fit <-extract_fit_parsnip(final_res)
+vip(xgb_fit, geom="col", num_features=30, aesthetics=list(color="grey50", fill=" dark blue"))
+```
+
+#Get model agnostic Shapley additive explanations (SHAP) and plot.
+```{r}
+mcl_shap <-
+  shap.prep(
+    xgb_model = extract_fit_engine(xgb_fit),
+    X_train = bake(mcl_prep,
+    has_role("predictor"),
+    new_data=NULL,
+    composition="matrix"
+    ), top_n=30
+  )
+```
+
+```{r}
+shap.plot.summary(mcl_shap, dilute=TRUE)
+```
+#Plot ROC curve
+```{r}
+final_res %>%
+  collect_predictions() %>%
+  group_by(id) %>% 
+  roc_curve(status, .pred_aggressive) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color=id)) +
+  geom_line(size = 1.5, color = "dark blue") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  )
+```
+```{r}
+parsimony_predict <- final_res %>%
+  collect_predictions() %>%
+  group_by(id)
+```
+
+#Make a Multivariate Logistic Model with Top 30 variable importance factors from 10 fold CV (full model).
+
+##Split into train and test set - use 10-cross-validation for parameter fit
+```{r}
+set.seed(102)
+mcl_glm_split <- initial_split(mcl_glm, strata = status)
+mcl_glm_train <- training(mcl_glm_split)
+mcl_glm_test <- testing(mcl_glm_split)
+mcl_glm_folds <- vfold_cv(mcl_glm_train, strata=status)
+```
+#Will need to impute all predictor variables - use k nearest neighbor imputation (KNN).
+```{r}
+mcl_glm_recipe <- recipe(status ~., data=mcl_glm_train) %>% 
+  update_role(pt_id, new_role = "id variable" ) %>% 
+  step_impute_knn(all_predictors()) %>% 
+  step_other(morph, ecog) %>% 
+  step_dummy(all_nominal_predictors())
+
+mcl_glm_recipe_prep <- prep(mcl_glm_recipe)
+juice(mcl_glm_recipe_prep)
+
+```
+#Set computational engine.
+```{r}
+mcl_glm_spec <- logistic_reg() %>% 
+  set_engine("glm")
+
+mcl_glm_spec
+```
+#Put together workflow
+```{r}
+mcl_glm_wf <- workflow() %>% 
+  add_recipe(mcl_glm_recipe)
+
+mcl_glm_wf
+```
+
+#Fit best model on validation and training sets.
+```{r}
+mcl_glm_metrics <- metric_set(roc_auc, accuracy, spec, sens)
+
+doParallel::registerDoParallel()
+
+mcl_glm_rs <- mcl_glm_wf %>% 
+  add_model(mcl_glm_spec) %>% 
+  fit_resamples(
+    resamples=mcl_glm_folds,
+    metrics = mcl_glm_metrics,
+    control=control_resamples(save_pred = TRUE)
+  )
+
+mcl_glm_rs
+```
+#Fit best model on test set.
+##Collect metrics and visualize confustion matrix.
+
+```{r}
+collect_metrics(mcl_glm_rs)
+```
+
+```{r}
+mcl_glm_final <- mcl_glm_wf %>% 
+  add_model(mcl_glm_spec) %>% 
+  last_fit(mcl_glm_split)
+
+mcl_glm_final
+collect_metrics(mcl_glm_final)
+```
+```{r}
+collect_predictions(mcl_glm_final) %>% 
+  conf_mat(status, .pred_class) %>% 
+  autoplot()
+```
+
+
+```{r}
+collect_metrics(mcl_glm_final)
+collect_predictions(mcl_glm_final) %>% 
+  conf_mat(status, .pred_class)
+```
+#Get coefficients from logistic model
+```{r}
+library(kableExtra)
+mcl_glm_final %>%
+  pull(.workflow) %>%
+  pluck(1) %>%
+  tidy() %>% 
+  arrange(estimate) %>%
+  kable(digits = 3)
+```
+#Plot model coefficients
+```{r}
+mcl_glm_final %>%
+  pull(.workflow) %>%
+  pluck(1) %>%
+  tidy() %>%
+  filter(term != "(Intercept)") %>%
+  ggplot(aes(estimate, fct_reorder(term, estimate))) +
+  geom_vline(xintercept = 0, color = "black", lty = 2, size = 1.2) +
+  geom_errorbar(aes(
+    xmin = estimate - std.error,
+    xmax = estimate + std.error
+  ),
+  width = .2, color = "black", alpha = 0.7
+  ) +
+  geom_point(size = 2, color = "#85144B") +
+  labs(y = NULL, x = "Coefficent from logistic regression")
+```
+
+#Univariate models incorporating existing prognostic indices.
+## MIPI classic
+```{r}
+set.seed(102)
+mcl_glm_split <- initial_split(MCL_GLM, strata = stat_death_progress)
+mcl_glm_train <- training(mcl_glm_split)
+mcl_glm_test <- testing(mcl_glm_split)
+mcl_glm_folds <- vfold_cv(mcl_glm_train, strata=stat_death_progress)
+```
+#Impute median values of MIPI
+```{r}
+mcl_glm_recipe <- recipe(stat_death_progress~ calc_MIPI, data=mcl_glm_train) %>% 
+  step_impute_median(all_numeric_predictors()) 
+ 
+
+mcl_glm_recipe_prep <- prep(mcl_glm_recipe)
+juice(mcl_glm_recipe_prep)
+```
+```{r}
+mcl_glm_spec <- logistic_reg() %>% 
+  set_engine("glm")
+
+mcl_glm_spec
+```
+
+```{r}
+mcl_glm_wf <- workflow() %>% 
+  add_recipe(mcl_glm_recipe)
+
+mcl_glm_wf
+```
+
+```{r}
+mcl_glm_metrics <- metric_set(roc_auc, accuracy, spec, sens)
+
+mcl_glm_rs <- mcl_glm_wf %>% 
+  add_model(mcl_glm_spec) %>% 
+  fit_resamples(
+    resamples=mcl_glm_folds,
+    metrics = mcl_glm_metrics,
+    control=control_resamples(save_pred = TRUE)
+  )
+
+mcl_glm_rs
+```
+
+#Univariate models incorporating existing prognostic indices.
+## Biological MIPI
+```{r}
+set.seed(102)
+mcl_glm_split <- initial_split(MCL_GLM, strata = stat_death_progress)
+mcl_glm_train <- training(mcl_glm_split)
+mcl_glm_test <- testing(mcl_glm_split)
+mcl_glm_folds <- vfold_cv(mcl_glm_train, strata=stat_death_progress)
+```
+#Impute median values of MIPI
+```{r}
+mcl_glm_recipe <- recipe(stat_death_progress~ biol_MIPI, data=mcl_glm_train) %>% 
+  step_impute_median(all_numeric_predictors()) 
+ 
+
+mcl_glm_recipe_prep <- prep(mcl_glm_recipe)
+juice(mcl_glm_recipe_prep)
+```
+```{r}
+mcl_glm_spec <- logistic_reg() %>% 
+  set_engine("glm")
+
+mcl_glm_spec
+```
+
+```{r}
+mcl_glm_wf <- workflow() %>% 
+  add_recipe(mcl_glm_recipe)
+
+mcl_glm_wf
+```
+
+```{r}
+mcl_glm_metrics <- metric_set(roc_auc, accuracy, spec, sens)
+
+mcl_glm_rs <- mcl_glm_wf %>% 
+  add_model(mcl_glm_spec) %>% 
+  fit_resamples(
+    resamples=mcl_glm_folds,
+    metrics = mcl_glm_metrics,
+    control=control_resamples(save_pred = TRUE)
+  )
+
+mcl_glm_rs
+```
+
+---
+title: "One variable type models"
+output: html_notebook
+---
+ 
+
+```{r}
+library(tidymodels)
+library(vip)
+```
+
+#Cytogenetic Only
+
+```{r}
+set.seed(102)
+mcl_split <- initial_split(cyto, strata=status)
+mcl_train <- training(mcl_split)
+mcl_test <- testing(mcl_split)
+
+mcl_folds<-vfold_cv(mcl_train, strata=status)
+```
+
+```{r}
+mcl_recipe<-recipe(status ~.,data=mcl_train) %>% 
+  update_role(pt_id, new_role = "id variable") %>% 
+  step_other(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_nominal_predictors())  
+
+
+
+mcl_prep <- prep(mcl_recipe)
+juice(mcl_prep)
+```
+
+
+```{r}
+xgb_spec <- boost_tree(
+  trees= 2000,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry= tune(),
+  learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_spec
+```
+
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  min_n(),
+  sample_size=sample_prop(),
+  tree_depth(),
+  loss_reduction (),
+  learn_rate(),
+  finalize(mtry(), mcl_train),
+  size = 50
+)
+
+xgb_grid 
+```
+
+```{r}
+xgb_wf <- workflow() %>%
+  add_recipe(mcl_recipe) %>% 
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(102)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = mcl_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+```
+
+```{r}
+collect_metrics(xgb_res)
+```
+
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+
+```{r}
+show_best(xgb_res, "roc_auc")
+```
+
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+```
+
+```{r}
+final_xgb <- 
+  finalize_workflow(xgb_wf, best_auc)
+
+final_xgb
+```
+
+```{r}
+xgb_last <- final_xgb %>% 
+  last_fit(mcl_split)
+```
+
+```{r}
+final_res <- last_fit(final_xgb, mcl_split)
+collect_metrics(final_res)
+```
+
+```{r}
+collect_predictions(xgb_last) %>% 
+  conf_mat(status, .pred_class) 
+```
+
+```{r}
+library(vip)
+library(jcolors)
+xgb_fit <-extract_fit_parsnip(xgb_last)
+vip(xgb_fit, geom="col", num_features=20, aesthetics=list(color="grey50", fill="red")) 
+```
+
+```{r}
+library(SHAPforxgboost)
+mcl_shap <-
+  shap.prep(
+    xgb_model = extract_fit_engine(xgb_fit),
+    X_train = bake(mcl_prep,
+    has_role("predictor"),
+    new_data=NULL,
+    composition="matrix"
+    ), top_n=20
+  )
+```
+```{r}
+cyto_predict <- final_res %>%
+  collect_predictions() %>%
+  group_by(id)
+```
+
+---
+title: "One variable type models"
+output: html_notebook
+---
+ 
+#ngs only
+```{r}
+library(tidymodels)
+library(vip)
+```
+
+
+
+```{r}
+set.seed(102)
+mcl_split <- initial_split(ngs, strata=status)
+mcl_train <- training(mcl_split)
+mcl_test <- testing(mcl_split)
+
+mcl_folds<-vfold_cv(mcl_train, strata=status)
+```
+
+```{r}
+mcl_recipe<-recipe(status ~.,data=mcl_train) %>% 
+  update_role(pt_id, new_role = "id variable") %>% 
+  step_other(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_nominal_predictors())  
+
+
+
+mcl_prep <- prep(mcl_recipe)
+juice(mcl_prep)
+```
+
+
+```{r}
+xgb_spec <- boost_tree(
+  trees= 2000,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry= tune(),
+  learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_spec
+```
+
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  min_n(),
+  sample_size=sample_prop(),
+  tree_depth(),
+  loss_reduction (),
+  learn_rate(),
+  finalize(mtry(), mcl_train),
+  size = 40
+)
+
+xgb_grid 
+```
+
+```{r}
+xgb_wf <- workflow() %>%
+  add_recipe(mcl_recipe) %>% 
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(102)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = mcl_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+```
+
+```{r}
+collect_metrics(xgb_res)
+```
+
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+
+```{r}
+show_best(xgb_res, "roc_auc")
+```
+
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+```
+
+```{r}
+final_xgb <- 
+  finalize_workflow(xgb_wf, best_auc)
+
+final_xgb
+```
+
+```{r}
+xgb_last <- final_xgb %>% 
+  last_fit(mcl_split)
+```
+
+```{r}
+final_res <- last_fit(final_xgb, mcl_split)
+collect_metrics(final_res)
+```
+
+```{r}
+collect_predictions(xgb_last) %>% 
+  conf_mat(status, .pred_class) 
+```
+
+```{r}
+library(vip)
+library(jcolors)
+xgb_fit <-extract_fit_parsnip(xgb_last)
+vip(xgb_fit, geom="col", num_features=30, aesthetics=list(color="grey50", fill="red")) 
+```
+
+```{r}
+library(SHAPforxgboost)
+mcl_shap <-
+  shap.prep(
+    xgb_model = extract_fit_engine(xgb_fit),
+    X_train = bake(mcl_prep,
+    has_role("predictor"),
+    new_data=NULL,
+    composition="matrix"
+    ), top_n=30
+  )
+```
+```{r}
+ngs_predict <- final_res %>%
+  collect_predictions() %>%
+  group_by(id)
+```
+
+
+```{r}
+library(writexl)
+
+write_xlsx(ngs_predict, "ngs_predict.xlsx")
+write_xlsx(cyto_predict, "cyto_predict.xlsx")
+write_xlsx(all_feature_model_predict, "all_predict.xlsx")
+write_xlsx(clinical_cyto_model_predict, "clin_cyto_predict.xlsx")
+write_xlsx(clinical_model_predict, "clin_predict.xlsx")
+write_xlsx(clinical_ngs_model_predict, "clin_ngs_predict.xlsx")
+write_xlsx(parsimony_predict, "parsimony_predict.xlsx")
+```
+
