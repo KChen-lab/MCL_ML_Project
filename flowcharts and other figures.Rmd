@@ -1,0 +1,80 @@
+---
+title: "flowchart"
+output: html_notebook
+---
+
+ ## 95 died after relapse
+ ## 138 alive after relapse
+ ## 24 LTFU after relapse
+ #28 dead not treated
+ 
+
+```{r}
+library(DiagrammeR)
+
+grViz("digraph flowchart{
+      #node definitions with substituted label text
+      graph[nodesep=.9, edgesep=.9]
+      node [fontname=Helvetica, shape=rectange]
+      tab1 [label='@@1' ]
+      tab2 [label='@@2' ]
+      tab3 [label='@@3' ]
+      tab4 [label='@@4' ]
+      tab5 [label='@@5']
+      tab6 [label='@@6']
+      tab7 [label='@@7']
+      tab8 [label='@@8']
+      tab9 [label='@@9']
+      tab10 [label='@@10']
+    
+      #edge definition with the nodeIDs
+      edge[color=gray]
+      
+      tab1 -> tab2;
+      tab2 -> tab3 -> tab4;
+      tab4 -> tab5; 
+      tab4-> tab6;
+      tab4-> tab7;
+      tab6 -> tab8;
+      tab6 -> tab9;
+      tab6 -> tab10}
+      
+      [1]: 'Patients: 2014-2022 (n=862)'
+      [2]: 'Lost to Follow Up (LTFU) without Relapse or Death (n=68)'
+      [3]:'Removed from data set (n=68)'
+      [4]:'Final dataset (n=794)'
+      [5]:'Dead (n=172)'
+      [6]:'Alive (n=598)'
+      [7]:'Relapsed, subsequently LTFU (n=24)'
+      [8]:'Relapsed (n=138)'
+      [9]:'Treated, but not relapsed (n=410)'
+      [10]:'Indolent (n=50)'
+")
+```
+```{r}
+
+grViz("digraph flowchart{
+      #node definitions with substituted label text
+      graph[nodesep=.9, edgesep=.9]
+      node [fontname=Helvetica, shape=rectange]
+      tab1 [label='@@1' ]
+      tab2 [label='@@2' ]
+      tab3 [label='@@3' ]
+      tab4 [label='@@4' ]
+    
+      #edge definition with the nodeIDs
+      edge[color=gray]
+      
+      tab1 -> tab2;
+      tab1 -> tab3; 
+      tab1 -> tab4
+      }
+      
+      [1]:'Clinico-pathologic Data (n=795)'
+      [2]:'Cytogenetic Data Only (n=320)'
+      [3]:'Genomic Data Only (n=22)'
+      [4]:'Cytogenetic and Genomic Data (n=300)'
+     
+")
+
+```

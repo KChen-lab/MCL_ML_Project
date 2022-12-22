@@ -1,0 +1,110 @@
+---
+title: "Roc Curves"
+output: html_notebook
+---
+
+ 
+
+```{r}
+# load tidyverse and tidymodels packages
+library(tidyverse)
+library(broom)
+library(yardstick)
+
+# load cowplot to change plot theme
+library(cowplot)
+library(ROCR)
+library(pROC)
+```
+
+```{r}
+#Change character variables to columns
+predictions_xgboost[sapply(predictions_xgboost, is.character)] <- lapply(predictions_xgboost[sapply(predictions_xgboost,is.character)], as.factor)
+
+
+
+predictions_xgboost %>%
+  group_by(model) %>% 
+  roc_curve(status, .pred_aggressive_all) %>%
+    ggplot(
+    aes(
+      x = 1 - specificity, 
+      y = sensitivity, 
+      color = model)
+  ) + # plot with ROC curves for each model
+  geom_line(size = 1) +
+  geom_abline(slope = 1, intercept = 0, size = 0.4) +
+  scale_color_manual(values = c("#48466D", "#3D84A8","red","green","orange","pink","black")) +
+  coord_fixed() +
+  theme_cowplot()
+  
+ 
+```
+
+
+
+#plot ROC curves with pROC
+
+```{r}
+
+roc1<- predictions_xgboost %>% 
+  filter(model=="all") %>% 
+  roc(status, .pred_aggressive_all)
+
+roc2<- predictions_xgboost %>% 
+  filter(model=="clinical") %>% 
+  roc(status, .pred_aggressive_all)
+
+roc3 <- predictions_xgboost %>% 
+  filter(model=="clin_ngs") %>% 
+  roc(status, .pred_aggressive_all)
+
+roc4 <- predictions_xgboost %>% 
+  filter(model=="clin_cyto") %>% 
+  roc(status, .pred_aggressive_all)
+
+roc5 <- predictions_xgboost %>% 
+  filter(model=="ngs") %>% 
+  roc(status, .pred_aggressive_all)
+
+roc6 <- predictions_xgboost %>% 
+  filter(model=="cyto") %>% 
+  roc(status, .pred_aggressive_all)
+
+roc7<- predictions_xgboost %>% 
+  filter(model=="parsimony") %>% 
+  roc(status, .pred_aggressive_all)
+
+g2 <- ggroc(list("All Features"=roc1, "Clinical"=roc2, "Clinical + NGS"=roc3, "Clinical + Cytogenetic"=roc4, "NGS Only"=roc5, "Cytogenetic Only"=roc6, "Parsimonious Model"=roc7))+ theme_minimal() + geom_abline(slope=1, intercept=1, linetype="dashed", alpha=0.7, color="grey") + coord_equal() + labs(x="Specificity", y="Sensitivity", color="Model")
+
+
+g2
+
+
+
+
+
+
+```
+#Plot ROC of GLM and Parimonious Model
+
+```{r}
+roc1<- predictions_xgboost_GLM %>% 
+  filter(model=="all features") %>% 
+  roc(status, .pred_aggressive)
+
+roc2<- predictions_xgboost_GLM %>% 
+  filter(model=="parsimony") %>% 
+  roc(status, .pred_aggressive)
+
+roc3 <- predictions_xgboost_GLM %>% 
+  filter(model=="GLM") %>% 
+  roc(status, .pred_aggressive)
+
+
+
+g3 <- ggroc(list("All Features"=roc1, "Parsimonious Model"=roc2, GLM=roc3)) + theme_minimal() + geom_abline(slope=1, intercept=1, linetype="dashed", alpha=0.7, color="grey") + coord_equal() + labs(x="Specificity", y="Sensitivity", color="Model")
+
+g3
+```
+
