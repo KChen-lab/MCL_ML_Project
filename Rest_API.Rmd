@@ -1,0 +1,215 @@
+---
+title: "Rest API for MCL"
+output: html_notebook
+---
+
+
+```{r}
+library(tidymodels)
+library(vetiver)
+library(plumber)
+```
+
+##The XGBoost model to launch
+##XGBoost Model with combined fearure selected set - "parsimonious"
+
+#Split dataset into training and test set. 
+#Make folds for cross-validation
+
+```{r}
+library(tidymodels)
+library(doParallel)
+
+set.seed(102)
+mcl_split <- initial_split(MCL_parsimony, strata=status)
+mcl_train <- training(mcl_split)
+mcl_test <- testing(mcl_split)
+
+mcl_folds<-vfold_cv(mcl_train, strata=status)
+
+```
+
+#Data preprocessing steps with recipe. Note: this will create new levels
+in a factor variable. This is okay with the XGBoost model
+
+```{r}
+mcl_recipe<-recipe(status ~.,data=mcl_train) %>% 
+  update_role(pt_id, new_role = "id variable") %>% 
+  step_other(all_nominal_predictors(), threshold=0.10) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_nominal_predictors())  
+
+
+mcl_prep <- prep(mcl_recipe)
+juice(mcl_prep)
+```
+#Tune hyperparameters
+
+```{r}
+xgb_spec <- boost_tree(
+  trees= 2000,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry= tune(),
+  learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_spec
+```
+#Use grid based / space fitting to cover hyperparameter space
+
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  min_n(),
+  sample_size=sample_prop(),
+  tree_depth(),
+  loss_reduction (),
+  learn_rate(),
+  finalize(mtry(), mcl_train),
+  size = 50
+)
+
+xgb_grid
+```
+#Finalize workflow with recipe and hyperparameter tuning specifications
+
+```{r}
+xgb_wf <- workflow() %>%
+  add_recipe(mcl_recipe) %>% 
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+#Set up parallel processing #Tune using the grid of hyperparameters and
+the resampled folds #You may get warnings for new levels created for
+sparse features - the hyperparameter fit will still work.
+
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(102)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = mcl_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+```
+#Collect metrics
+
+```{r}
+collect_metrics(xgb_res)
+```
+
+#Visualize hyperparameter metrics for the possible models
+
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+
+#Show the best performing set of parameters
+
+```{r}
+show_best(xgb_res, "roc_auc")
+```
+#Select best hyperparameters based on AUC
+
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+```
+
+#Finalize workflow with the hyperparameter values
+
+```{r}
+final_xgb <- 
+  finalize_workflow(xgb_wf, best_auc)
+
+final_xgb
+```
+
+##Incorporate the hyperparameter values into the last fit and fit the
+model on the test set.
+
+```{r}
+xgb_last_pars <- final_xgb %>% 
+  last_fit(mcl_split) %>% mutate(model="Parsimonious")
+```
+
+#Evaluate model performance.
+
+```{r}
+final_res <- last_fit(final_xgb, mcl_split)
+collect_metrics(final_res)
+```
+
+#Make a confusion matrix showing predictions.
+
+```{r}
+collect_predictions(xgb_last_pars) %>% 
+  conf_mat(status, .pred_class) 
+```
+
+#Which variables were most important to the prediction? Make Variable
+Importance Plot (VIP).
+
+```{r}
+library(vip)
+xgb_fit <-extract_fit_parsnip(final_res)
+vip(xgb_fit, geom="col", num_features=24, aesthetics=list(color="grey50", fill=" dark blue"))
+```
+
+##Deploy the model
+
+```{r}
+mcl <- final_res %>% 
+  extract_workflow() %>% 
+  vetiver_model("MCL")
+
+mcl
+```
+
+```{r}
+augment(mcl, slice_sample(mcl_test, n=10))
+```
+
+#Set up API
+
+```{r}
+##pipe to "pr_run()"
+
+pr() %>% 
+  vetiver_api(mcl)
+
+```
+#For probabilities instead of class use this.
+```{r}
+pr() %>% 
+  vetiver_api(mcl, type="prob") %>%
+  pr_run()
+```
+
+#Generate plumber and docker files
+```{r}
+vetiver_write_plumber(mcl, "HAHill/MCL_predict", rsconnect = FALSE)
+vetiver_write_docker(mcl)
+```
+
+
