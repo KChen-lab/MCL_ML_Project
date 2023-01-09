@@ -1,0 +1,65 @@
+---
+title: "MIPI compare"
+output: html_notebook
+---
+
+
+
+```{r}
+library(tidymodels)
+```
+
+```{r}
+set.seed(102)
+mcl_glm_split <- initial_split(MCL_GLM, strata = stat_death_progress)
+mcl_glm_train <- training(mcl_glm_split)
+mcl_glm_test <- testing(mcl_glm_split)
+mcl_glm_folds <- vfold_cv(mcl_glm_train, strata=stat_death_progress)
+```
+
+
+```{r}
+mcl_glm_recipe <- recipe(stat_death_progress~ calc_MIPI, data=mcl_glm_train) %>% 
+  step_impute_median(all_numeric_predictors()) 
+ 
+
+mcl_glm_recipe_prep <- prep(mcl_glm_recipe)
+juice(mcl_glm_recipe_prep)
+```
+```{r}
+mcl_glm_spec <- logistic_reg() %>% 
+  set_engine("glm")
+
+mcl_glm_spec
+```
+
+```{r}
+mcl_glm_wf <- workflow() %>% 
+  add_recipe(mcl_glm_recipe)
+
+mcl_glm_wf
+```
+
+```{r}
+mcl_glm_metrics <- metric_set(roc_auc, accuracy, spec, sens)
+
+doParallel::registerDoParallel()
+
+mcl_glm_rs <- mcl_glm_wf %>% 
+  add_model(mcl_glm_spec) %>% 
+  fit_resamples(
+    resamples=mcl_glm_folds,
+    metrics = mcl_glm_metrics,
+    control=control_resamples(save_pred = TRUE)
+  )
+
+mcl_glm_rs
+```
+```{r}
+collect_metrics(mcl_glm_rs)
+```
+
+```{r}
+
+```
+
