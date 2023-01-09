@@ -1,0 +1,317 @@
+---
+title: "Survival Models and Data Vis"
+output: html_notebook
+---
+
+
+
+```{r}
+library(survival)
+library(ggsurvfit)
+library(tidyverse)
+library(tidymodels)
+library(ggcorrplot)
+library(ggplot2)
+library(censored)
+
+```
+#Visualize difference in survival between classes
+```{r}
+MCL_s1 <-survfit(Surv(tte_fu, stat_code_os) ~1, data=MCL_survival)
+str(MCL_s1)
+
+#Whole cohort
+survfit2(Surv(tte_fu, stat_code_os) ~1, data=MCL_survival) %>% 
+  ggsurvfit()+
+  labs(
+    x="Days",
+    y="Overall Survival Probability"
+  ) + 
+  add_confidence_interval()+
+  add_risktable()
+
+```
+```{r}
+#Between class groups
+
+survdiff(formula=Surv(tte_fu, stat_code_os) ~status, data=MCL_survival) 
+```
+
+```{r}
+survfit2(Surv(tte_fu, stat_code_os) ~status, data=MCL_survival) %>% 
+  ggsurvfit()+
+  labs(
+    x="Days",
+    y="Overall Survival Probability"
+  ) + 
+  add_confidence_interval()+
+  add_risktable()
+```
+
+
+```{r}
+MCL_cox[23] <- sapply(MCL_cox[23], as.factor)
+MCL_cox[25] <- sapply(MCL_cox[25], as.factor)
+
+#Remove "status" variable
+MCL_cox <- select(MCL_cox, -status)
+MCL_cox <- select(MCL_cox, -pt_id)
+MCL_cox <- select(MCL_cox, -nf1)
+
+MCL_cox <- select(MCL_cox, -vital_stat)
+```
+
+#Visualize continuous variables
+```{r}
+#Ki 67%
+MCL_cox %>% 
+  ggplot(aes(ki_67)) +
+  geom_histogram(bins=20)+
+  scale_x_continuous(limits=c(0,100))+
+  labs(y="number of patients", x="ki 67 %")
+```
+
+
+```{r}
+#White blood cell count (WBC)
+
+MCL_cox %>% 
+  ggplot(aes(wbc)) +
+  geom_histogram(bins=30)+
+  scale_x_continuous(limits=c(500,5000))+
+  labs(y="number of patients", x="WBC")
+```
+```{r}
+MCL_cox %>% 
+  ggplot(aes(bm)) +
+  geom_histogram(bins=30)+
+  scale_x_continuous(limits=c(0,100))+
+  labs(y="number of patients", x="Bone Marrow Infiltration %")
+```
+```{r}
+MCL_cox %>% 
+  ggplot(aes(ldh)) +
+  geom_histogram(bins=30)+
+  scale_x_continuous(limits=c(50,500))+
+  labs(y="number of patients", x="LDH")
+```
+```{r}
+MCL_cox %>% 
+  ggplot(aes(b2m)) +
+  geom_histogram(bins=30)+
+  scale_x_continuous(limits=c(0,10))+
+  labs(y="number of patients", x="Beta 2 Microglobulin")
+```
+```{r}
+MCL_cox %>% 
+  ggplot(aes(wbc)) +
+  geom_histogram(bins=30)+
+  scale_x_continuous(limits=c(500,5000))+
+  labs(y="number of patients", x="WBC")
+```
+
+```{r}
+MCL_cox %>% 
+  ggplot(aes(platelets)) +
+  geom_histogram(bins=30)+
+  scale_x_continuous(limits=c(100,1000))+
+  labs(y="number of patients", x="Platelets")
+```
+```{r}
+MCL_cox %>% 
+  ggplot(aes(alcohol)) +
+  geom_histogram(bins=30)+
+  scale_x_continuous(limits=c(0,100)) +
+  scale_y_discrete(limits=c(0, 200))+
+  labs(y="number of patients", x="Drinks per week")
+```
+#PFS model
+#Make stat code and time variables numeric.
+
+```{r}
+MCL_cox_pfs$tte_fu <- as.numeric(MCL_cox_pfs$tte_fu)
+MCL_cox_pfs$stat_code <- as.numeric(MCL_cox_pfs$stat_code)
+
+```
+
+#Data preprocessing
+```{r}
+mclcox_recipe <- recipe(MCL_cox_pfs, stat_code ~ .) %>% 
+  update_role(pt_id, new_role = "id variable") %>% 
+  update_role (tte_fu, new_role = "follow up time") %>% 
+  step_string2factor(all_string()) %>% 
+  step_impute_knn(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_other(morph, threshold=.05) 
+
+ 
+
+mcl_cox_prep <- prep(mclcox_recipe)
+
+
+MCL_cox <- juice(mcl_cox_prep)
+
+MCL_cox<-select(MCL_cox, -pt_id)
+
+```
+
+#Define the Cox model
+
+```{r}
+ph_spec <- 
+  proportional_hazards() %>% 
+  set_engine("survival") %>% 
+  set_mode("censored regression")
+
+ph_spec
+```
+
+#Create model fit object
+```{r}
+set.seed(102)
+
+ph_fit <- ph_spec %>% fit(Surv(tte_fu, stat_code) ~., data=MCL_cox)
+
+ph_fit
+
+
+```
+#run with regular survival package
+```{r}
+MCL_coxph<-coxph(formula=Surv(tte_fu, stat_code) ~., data=MCL_cox)
+```
+
+```{r}
+summary(MCL_coxph)
+```
+#Make table
+```{r}
+library(gtsummary)
+
+cox_ph_pfs <- MCL_coxph %>% 
+  tbl_regression(exponentiate=TRUE, show_single_row=(c("b_symptoms","tp53","card11","birc3","notch1","ros1","gi_involve")))%>% 
+  add_significance_stars() 
+  
+```
+
+#Model for OS
+
+```{r}
+MCL_cox_os$tte_fu <- as.numeric(MCL_cox_os$tte_fu)
+MCL_cox_os$stat_code_os <- as.numeric(MCL_cox_os$stat_code_os)
+
+
+
+```
+
+#Data preprocessing
+```{r}
+mclcox_recipe <- recipe(MCL_cox_os, stat_code_os ~ .) %>% 
+  update_role(pt_id, new_role = "id variable") %>% 
+  update_role (tte_fu, new_role = "follow up time") %>% 
+  step_string2factor(all_string()) %>% 
+  step_impute_knn(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_other(morph, threshold=.05) 
+
+ 
+
+mcl_cox_prep <- prep(mclcox_recipe)
+
+MCL_cox_dataset <- juice(mcl_cox_prep)
+
+juice(mcl_cox_prep)
+MCL_cox_dataset<-select(MCL_cox_dataset, -pt_id)
+
+```
+#Define the Cox model
+
+```{r}
+ph_spec <- 
+  proportional_hazards() %>% 
+  set_engine("survival") %>% 
+  set_mode("censored regression")
+
+ph_spec
+```
+
+#Create model fit object
+```{r}
+set.seed(102)
+
+ph_fit <- ph_spec %>% fit(Surv(tte_fu, stat_code_os) ~., data=MCL_cox_dataset)
+
+ph_fit
+
+```
+#run with regular survival package
+```{r}
+MCL_coxph<-coxph(formula=Surv(tte_fu, stat_code_os) ~., data=MCL_cox_dataset)
+
+
+
+summary(MCL_coxph)
+
+cox_ph_os <- MCL_coxph %>% 
+  tbl_regression(exponentiate=TRUE,show_single_row=(c("b_symptoms","tp53","card11","birc3","notch1","ros1","gi_involve"))) %>% 
+  add_significance_stars()
+
+cox_ph_os
+```
+
+```{r}
+library(gtsummary)
+
+cox_ph_os <- MCL_coxph %>% 
+  tbl_regression(exponentiate=TRUE, show_single_row=(c("b_symptoms","tp53","card11","birc3","notch1","ros1","gi_involve")))  %>% 
+  add_significance_stars() 
+
+cox_ph_os
+
+
+```
+
+
+#merge with OS table.
+```{r}
+
+tbl_merge_cox <- tbl_merge(
+  tbls=list(cox_ph_pfs, cox_ph_os),
+  tab_spanner = c("**Progression Free Survival**","**Overall Survival**")) %>% 
+    as_gt() %>% 
+  gt::tab_header(title="Table 4: Cox Regression Models") %>% 
+  sub_values(values="morph", replacement = "Morphology") %>% 
+  sub_values(values="ki_67", replacement = "Ki-67 %") %>% 
+  sub_values(values="bm", replacement = "Bone Marrow Involvement")%>% 
+  sub_values(values="ldh", replacement = "Lactate Dehydrogenase") %>%    
+  sub_values(values="b2m", replacement = "Beta 2 Microglobulin") %>% 
+  sub_values(values="wbc", replacement = "White Blood Cell Count") %>% 
+  sub_values(values="hgb", replacement = "Hemoglobin") %>% 
+  sub_values(values="platelets", replacement = "Platelets") %>% 
+  sub_values(values="smoke", replacement = "Smoking Status") %>% 
+  sub_values(values="ecog", replacement = "ECOG") %>% 
+  sub_values(values="b_symptoms", replacement = "B Symptoms") %>% 
+  sub_values(values="age_dx_years", replacement = "Age at Diagnosis") %>% 
+  sub_values(values="bmi", replacement = "BMI") %>% 
+  sub_values(values="tp53", replacement = "TP53 mutation") %>% 
+  sub_values(values="card11", replacement = "CARD11 mutation") %>% 
+  sub_values(values="total_genes_mutated", replacement = "Number of Somatic Mutations") %>% 
+  sub_values(values="birc3", replacement = "BIRC3 mutation") %>% 
+  sub_values(values="gi_involve", replacement = "GI Involvement") %>%
+  sub_values(values="notch1", replacement = "NOTCH1 mutation") %>% 
+  sub_values(values="ros1", replacement = "ROS1 mutation") %>% 
+  opt_vertical_padding(scale=0.40)
+  
+  
+               
+                
+                
+  
+
+tbl_merge_cox %>% 
+  as_flex_table() %>% 
+  flextable::save_as_docx(tbl_merge_cox, path="cox_models_2.docx")
+
+```
+
+
