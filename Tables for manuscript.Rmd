@@ -1,0 +1,62 @@
+---
+title: "Manuscript Tables"
+output: html_notebook
+---
+
+
+```{r}
+library(mde)
+library(gt)
+library(gtExtras)
+library(tidyverse)
+```
+
+```{r}
+missing_MCL <- na_summary(MCL_final_datasets) 
+
+missing_MCL <- rename(missing_MCL, "Percent Complete" = percent_complete)
+missing_MCL <-rename(missing_MCL, "Percent Missing" = percent_missing)
+missing_MCL <-rename(missing_MCL, "Feature" = variable)
+missing_MCL <-rename(missing_MCL, "Complete" = complete)
+missing_MCL <-rename(missing_MCL, "Missing" = missing)
+
+mcl_missing <- missing_MCL %>% 
+  gt() %>% 
+  tab_header(title = "Missingness Among Full Dataset Features") %>% 
+  fmt_number(columns=c("Percent Complete", "Percent Missing"),
+    decimals = 2)
+
+
+  
+```
+
+```{r}
+
+final_metrics %>% 
+  gt() %>% 
+  tab_header(title="Table 2: Performance Metrics of Prognostic MCL Models") %>% 
+  fmt_number(columns=4:12) %>% 
+  gt_hulk_col_numeric(c("AUC Train", "AUC Test","Accuracy","Sensitivity", "Specificity", "PPV", "F1", "NPV", "PLR")) %>% 
+  tab_source_note(source_note = "AUC = area under the reciever operating characteristic curve") %>% 
+  tab_source_note(source_note ="PPV = positive predictive value, NPV = negative predictive value") %>% 
+  tab_source_note(source_note ="PLR = positive likelihood ratio, F1=F1 score") %>% 
+  tab_source_note(source_note = "cyto=cytogenetic, ngs=next generation sequencing") %>% 
+  tab_source_note(source_note = "GLM = generalized linear model - a multivariate logistic model") %>% 
+  tab_footnote(footnote = "MIPI = mantle cell lymphoma international prognostic index. Constructed from LDH/ULN, age at diagnosis, and ECOG performance status", locations = cells_body(columns=c("Model"), 8), placement="right") %>% 
+  tab_footnote(footnote = "MIPIb = Biological MIPI - adds Ki67%, a proliferation index", locations = cells_body(columns=c("Model"), 9), placement="right") %>% 
+  tab_footnote(footnote = "A concordance index (C) is used instead of AUC for proportional hazards (PH) models", locations = cells_body(columns=c("AUC Test"), 10:11), placement="right")
+
+
+  
+```
+
+#Supplementary table 3 - model hyperparameters
+```{r}
+na.omit(hyperparam) %>% 
+  gt() %>% 
+  tab_header(title = "Supplementary Table 3: Hyperparameters for XGBoost Models") %>% 
+  fmt_number(columns=2:8, decimals=6, drop_trailing_zeros=TRUE)
+  
+  
+```
+
