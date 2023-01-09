@@ -15,116 +15,7 @@ library(ggplot2)
 library(censored)
 
 ```
-#Visualize difference in survival between classes
-```{r}
-MCL_s1 <-survfit(Surv(tte_fu, stat_code_os) ~1, data=MCL_survival)
-str(MCL_s1)
 
-#Whole cohort
-survfit2(Surv(tte_fu, stat_code_os) ~1, data=MCL_survival) %>% 
-  ggsurvfit()+
-  labs(
-    x="Days",
-    y="Overall Survival Probability"
-  ) + 
-  add_confidence_interval()+
-  add_risktable()
-
-```
-```{r}
-#Between class groups
-
-survdiff(formula=Surv(tte_fu, stat_code_os) ~status, data=MCL_survival) 
-```
-
-```{r}
-survfit2(Surv(tte_fu, stat_code_os) ~status, data=MCL_survival) %>% 
-  ggsurvfit()+
-  labs(
-    x="Days",
-    y="Overall Survival Probability"
-  ) + 
-  add_confidence_interval()+
-  add_risktable()
-```
-
-
-```{r}
-MCL_cox[23] <- sapply(MCL_cox[23], as.factor)
-MCL_cox[25] <- sapply(MCL_cox[25], as.factor)
-
-#Remove "status" variable
-MCL_cox <- select(MCL_cox, -status)
-MCL_cox <- select(MCL_cox, -pt_id)
-MCL_cox <- select(MCL_cox, -nf1)
-
-MCL_cox <- select(MCL_cox, -vital_stat)
-```
-
-#Visualize continuous variables
-```{r}
-#Ki 67%
-MCL_cox %>% 
-  ggplot(aes(ki_67)) +
-  geom_histogram(bins=20)+
-  scale_x_continuous(limits=c(0,100))+
-  labs(y="number of patients", x="ki 67 %")
-```
-
-
-```{r}
-#White blood cell count (WBC)
-
-MCL_cox %>% 
-  ggplot(aes(wbc)) +
-  geom_histogram(bins=30)+
-  scale_x_continuous(limits=c(500,5000))+
-  labs(y="number of patients", x="WBC")
-```
-```{r}
-MCL_cox %>% 
-  ggplot(aes(bm)) +
-  geom_histogram(bins=30)+
-  scale_x_continuous(limits=c(0,100))+
-  labs(y="number of patients", x="Bone Marrow Infiltration %")
-```
-```{r}
-MCL_cox %>% 
-  ggplot(aes(ldh)) +
-  geom_histogram(bins=30)+
-  scale_x_continuous(limits=c(50,500))+
-  labs(y="number of patients", x="LDH")
-```
-```{r}
-MCL_cox %>% 
-  ggplot(aes(b2m)) +
-  geom_histogram(bins=30)+
-  scale_x_continuous(limits=c(0,10))+
-  labs(y="number of patients", x="Beta 2 Microglobulin")
-```
-```{r}
-MCL_cox %>% 
-  ggplot(aes(wbc)) +
-  geom_histogram(bins=30)+
-  scale_x_continuous(limits=c(500,5000))+
-  labs(y="number of patients", x="WBC")
-```
-
-```{r}
-MCL_cox %>% 
-  ggplot(aes(platelets)) +
-  geom_histogram(bins=30)+
-  scale_x_continuous(limits=c(100,1000))+
-  labs(y="number of patients", x="Platelets")
-```
-```{r}
-MCL_cox %>% 
-  ggplot(aes(alcohol)) +
-  geom_histogram(bins=30)+
-  scale_x_continuous(limits=c(0,100)) +
-  scale_y_discrete(limits=c(0, 200))+
-  labs(y="number of patients", x="Drinks per week")
-```
 #PFS model
 #Make stat code and time variables numeric.
 
@@ -144,10 +35,7 @@ mclcox_recipe <- recipe(MCL_cox_pfs, stat_code ~ .) %>%
   step_normalize(all_numeric_predictors()) %>% 
   step_other(morph, threshold=.05) 
 
- 
-
 mcl_cox_prep <- prep(mclcox_recipe)
-
 
 MCL_cox <- juice(mcl_cox_prep)
 
